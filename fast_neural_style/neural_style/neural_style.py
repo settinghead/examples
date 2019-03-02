@@ -12,6 +12,9 @@ from torchvision import datasets
 from torchvision import transforms
 import torch.onnx
 
+import random
+
+
 import utils
 from transformer_net import TransformerNet
 from vgg import Vgg16
@@ -30,6 +33,11 @@ def check_paths(args):
 
 def train(args):
     device = torch.device("cuda" if args.cuda else "cpu")
+
+    lambda_noise = args.lambda_noise
+    noise_range = args.noise
+    noise_count = args.noisecount
+    image_size = args.image_size
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -60,6 +68,23 @@ def train(args):
     gram_style = [utils.gram_matrix(y) for y in features_style]
 
     for e in range(args.epochs):
+
+        if noise_count:
+            noiseimg = np.zeros((3, image_size, image_size), dtype=np.float32)
+
+            # prepare a noise image
+            for ii in range(noise_count):
+                xx = random.randrange(image_size)
+                yy = random.randrange(image_size)
+
+                noiseimg[0][yy][xx] += random.randrange(-noise_range,
+                                                        noise_range)
+                noiseimg[1][yy][xx] += random.randrange(-noise_range,
+                                                        noise_range)
+                noiseimg[2][yy][xx] += random.randrange(-noise_range,
+                                                        noise_range)
+            noiseimg = torch.from_numpy(noiseimg)
+
         transformer.train()
         agg_content_loss = 0.
         agg_style_loss = 0.
@@ -69,7 +94,15 @@ def train(args):
             count += n_batch
             optimizer.zero_grad()
 
+            if noise_count:
+                # add the noise image to the source image
+                noisy_x = x.clone()
+                noisy_x = noisy_x + noiseimg
+                noisy_y = transformer(noisy_x.cuda())
+                noisy_y = utils.normalize_batch(noisy_y)
+
             x = x.to(device)
+
             y = transformer(x)
 
             y = utils.normalize_batch(y)
@@ -78,7 +111,8 @@ def train(args):
             features_y = vgg(y)
             features_x = vgg(x)
 
-            content_loss = args.content_weight * mse_loss(features_y.relu2_2, features_x.relu2_2)
+            content_loss = args.content_weight * \
+                mse_loss(features_y.relu2_2, features_x.relu2_2)
 
             style_loss = 0.
             for ft_y, gm_s in zip(features_y, gram_style):
@@ -86,7 +120,12 @@ def train(args):
                 style_loss += mse_loss(gm_y, gm_s[:n_batch, :, :])
             style_loss *= args.style_weight
 
-            total_loss = content_loss + style_loss
+            if noise_count:
+                pop_loss = lambda_noise * mse_loss(y, noisy_y)
+                total_loss = content_loss + style_loss + pop_loss
+            else:
+                total_loss = content_loss + style_loss
+
             total_loss.backward()
             optimizer.step()
 
@@ -96,16 +135,18 @@ def train(args):
             if (batch_id + 1) % args.log_interval == 0:
                 mesg = "{}\tEpoch {}:\t[{}/{}]\tcontent: {:.6f}\tstyle: {:.6f}\ttotal: {:.6f}".format(
                     time.ctime(), e + 1, count, len(train_dataset),
-                                  agg_content_loss / (batch_id + 1),
-                                  agg_style_loss / (batch_id + 1),
-                                  (agg_content_loss + agg_style_loss) / (batch_id + 1)
+                    agg_content_loss / (batch_id + 1),
+                    agg_style_loss / (batch_id + 1),
+                    (agg_content_loss + agg_style_loss) / (batch_id + 1)
                 )
                 print(mesg)
 
             if args.checkpoint_model_dir is not None and (batch_id + 1) % args.checkpoint_interval == 0:
                 transformer.eval().cpu()
-                ckpt_model_filename = "ckpt_epoch_" + str(e) + "_batch_id_" + str(batch_id + 1) + ".pth"
-                ckpt_model_path = os.path.join(args.checkpoint_model_dir, ckpt_model_filename)
+                ckpt_model_filename = "ckpt_epoch_" + \
+                    str(e) + "_batch_id_" + str(batch_id + 1) + ".pth"
+                ckpt_model_path = os.path.join(
+                    args.checkpoint_model_dir, ckpt_model_filename)
                 torch.save(transformer.state_dict(), ckpt_model_path)
                 transformer.to(device).train()
 
@@ -122,7 +163,8 @@ def train(args):
 def stylize(args):
     device = torch.device("cuda" if args.cuda else "cpu")
 
-    content_image = utils.load_image(args.content_image, scale=args.content_scale)
+    content_image = utils.load_image(
+        args.content_image, scale=args.content_scale)
     content_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x.mul(255))
@@ -143,8 +185,10 @@ def stylize(args):
             style_model.load_state_dict(state_dict)
             style_model.to(device)
             if args.export_onnx:
-                assert args.export_onnx.endswith(".onnx"), "Export model file should end with .onnx"
-                output = torch.onnx._export(style_model, content_image, args.export_onnx).cpu()
+                assert args.export_onnx.endswith(
+                    ".onnx"), "Export model file should end with .onnx"
+                output = torch.onnx._export(
+                    style_model, content_image, args.export_onnx).cpu()
             else:
                 output = style_model(content_image).cpu()
     utils.save_image(args.output_image, output[0])
@@ -162,7 +206,8 @@ def stylize_onnx_caffe2(content_image, args):
 
     model = onnx.load(args.model)
 
-    prepared_backend = onnx_caffe2.backend.prepare(model, device='CUDA' if args.cuda else 'CPU')
+    prepared_backend = onnx_caffe2.backend.prepare(
+        model, device='CUDA' if args.cuda else 'CPU')
     inp = {model.graph.input[0].name: content_image.numpy()}
     c2_out = prepared_backend.run(inp)[0]
 
@@ -170,13 +215,16 @@ def stylize_onnx_caffe2(content_image, args):
 
 
 def main():
-    main_arg_parser = argparse.ArgumentParser(description="parser for fast-neural-style")
-    subparsers = main_arg_parser.add_subparsers(title="subcommands", dest="subcommand")
+    main_arg_parser = argparse.ArgumentParser(
+        description="parser for fast-neural-style")
+    subparsers = main_arg_parser.add_subparsers(
+        title="subcommands", dest="subcommand")
 
-    train_arg_parser = subparsers.add_parser("train", help="parser for training arguments")
+    train_arg_parser = subparsers.add_parser(
+        "train", help="parser for training arguments")
     train_arg_parser.add_argument("--epochs", type=int, default=2,
                                   help="number of training epochs, default is 2")
-    train_arg_parser.add_argument("--batch-size", type=int, default=4,
+    train_arg_parser.add_argument("--batch-size", type=int, default=8,
                                   help="batch size for training, default is 4")
     train_arg_parser.add_argument("--dataset", type=str, required=True,
                                   help="path to training dataset, the path should point to a folder "
@@ -206,7 +254,15 @@ def main():
     train_arg_parser.add_argument("--checkpoint-interval", type=int, default=2000,
                                   help="number of batches after which a checkpoint of the trained model will be created")
 
-    eval_arg_parser = subparsers.add_parser("eval", help="parser for evaluation/stylizing arguments")
+    train_arg_parser.add_argument('--lambda_noise', default=1000.0, type=float,
+                                  help='Training weight of the popping induced by noise')
+    train_arg_parser.add_argument('--noise', default=30, type=int,
+                                  help='range of noise for popping reduction')
+    train_arg_parser.add_argument('--noisecount', default=1000, type=int,
+                                  help='number of pixels to modify with noise')
+
+    eval_arg_parser = subparsers.add_parser(
+        "eval", help="parser for evaluation/stylizing arguments")
     eval_arg_parser.add_argument("--content-image", type=str, required=True,
                                  help="path to content image you want to stylize")
     eval_arg_parser.add_argument("--content-scale", type=float, default=None,
